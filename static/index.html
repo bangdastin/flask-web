@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Car Detection</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #cfd3d6;
+        }
+        .container {
+            text-align: center;
+        }
+        .box {
+            background-color: #a9adb1;
+            padding: 20px;
+            margin: 15px;
+            border-radius: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .upload-btn {
+            background-color: #1a237e;
+        }
+        .scan-btn {
+            background-color: #1a237e;
+        }
+        .result-box {
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            min-height: 100px;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            margin-top: 20px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>Car Detection</h2>
+    <div class="box">
+        <input type="file" id="imageUpload" accept="image/*">
+        <button class="upload-btn" onclick="previewImage()">UPLOAD</button>
+    </div>
+    <div class="box">
+        <button class="scan-btn" onclick="detectCar()">SCAN</button>
+    </div>
+    <div class="box result-box">
+        <h3>Result</h3>
+        <p id="resultText">No result yet.</p>
+        <img id="preview" src="#" alt="Image preview" style="display:none;" />
+    </div>
+</div>
+
+<script>
+    let uploadedImageFile = null;
+
+    function previewImage() {
+        const file = document.getElementById('imageUpload').files[0];
+        if (file) {
+            uploadedImageFile = file;
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const preview = document.getElementById('preview');
+                preview.src = e.target.result;
+                preview.style.display = 'block';
+            }
+            reader.readAsDataURL(file);
+        }
+    }
+
+    async function detectCar() {
+    if (!uploadedImageFile) {
+        alert("Please upload an image first.");
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('image', uploadedImageFile);
+
+    document.getElementById('resultText').innerText = "Scanning...";
+
+    try {
+        const response = await fetch('http://127.0.0.1:5000/detect', {
+            method: 'POST',
+            body: formData
+        });
+
+        const result = await response.json();
+        if (response.ok) {
+            document.getElementById('resultText').innerText = `Detected: ${result.cars_detected} Car(s)`;
+
+            const preview = document.getElementById('preview');
+            preview.src = result.image_url; // Has cache-buster now
+            preview.style.display = 'block';
+        } else {
+            document.getElementById('resultText').innerText = result.error || "Detection failed.";
+        }
+    } catch (error) {
+        console.error('Error:', error);
+        document.getElementById('resultText').innerText = "Error contacting server.";
+    }
+}
+
+</script>
+</body>
+</html>
