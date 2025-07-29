@@ -12,7 +12,7 @@ import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import (
     Input, Conv2D, MaxPooling2D, TimeDistributed, Flatten,
-    Dense, Dropout, Layer, Add, UpSampling2D
+    Dense, Dropout, Layer, Add, Lambda
 )
 from tensorflow.keras.models import Model
 from tensorflow.keras import initializers
@@ -33,7 +33,7 @@ CONFIG_PATH = "config_fpn_standard_kaggle.pickle"
 SCORE_THRESH = 0.7
 
 # --------------------------------------------------------------------
-# BAGIAN 1: DEFINISI KELAS DAN FUNGSI (Diambil dari skrip training)
+# BAGIAN 1: DEFINISI KELAS DAN FUNGSI (SESUAI KODE TRAINING)
 # --------------------------------------------------------------------
 
 class Config:
@@ -70,44 +70,158 @@ class Config:
         self.learning_rate = 1e-5
 
 class RoiPoolingConv(Layer):
-    """Lapisan ROI Pooling untuk FPN."""
+    """Lapisan ROI Pooling - VERSI IDENTIK DENGAN KODE TRAINING."""
     def __init__(self, pool_size, num_rois, **kwargs):
+        self.data_format = K.image_data_format()
         self.pool_size = pool_size
         self.num_rois = num_rois
         super(RoiPoolingConv, self).__init__(**kwargs)
 
     def build(self, input_shape):
-        self.nb_channels = input_shape[0][3]
+        self.nb_channels = (
+            input_shape[0][3]
+            if self.data_format == "channels_last"
+            else input_shape[0][1]
+        )
+        super(RoiPoolingConv, self).build(input_shape)
 
     def compute_output_shape(self, input_shape):
-        return None, self.num_rois, self.pool_size, self.pool_size, self.nb_channels
+        if self.data_format == "channels_first":
+            return (input_shape[0][0], self.num_rois, self.nb_channels, self.pool_size, self.pool_size)
+        else:
+            return (input_shape[0][0], self.num_rois, self.pool_size, self.pool_size, self.nb_channels)
 
     def call(self, x, mask=None):
         feature_map, rois = x[0], x[1]
         batch_size = K.shape(rois)[0]
+        fm_shape = K.shape(feature_map)
+        
+        if self.data_format == "channels_last":
+            fm_height = K.cast(fm_shape[1], K.floatx())
+            fm_width = K.cast(fm_shape[2], K.floatx())
+        else:
+            fm_height = K.cast(fm_shape[2], K.floatx())
+            fm_width = K.cast(fm_shape[3], K.floatx())
+
+        # Logika dari kode training yang mengasumsikan batch_size=1,
+        # kita buat lebih robust untuk inferensi.
         num_rois_here = K.shape(rois)[1]
         rois_flat = K.reshape(rois, (-1, 4))
         box_indices = tf.repeat(tf.range(batch_size), repeats=num_rois_here)
-
-        fm_shape = K.shape(feature_map)
-        fm_height = K.cast(fm_shape[1], K.floatx())
-        fm_width = K.cast(fm_shape[2], K.floatx())
-
-        y1 = rois_flat[:, 1] / (fm_height - 1.0)
-        x1 = rois_flat[:, 0] / (fm_width - 1.0)
-        y2 = rois_flat[:, 3] / (fm_height - 1.0)
-        x2 = rois_flat[:, 2] / (fm_width - 1.0)
-
-        normalized_boxes = K.stack([y1, x1, y2, x2], axis=1)
-
+        
+        x1, y1, x2, y2 = (rois_flat[:, 0], rois_flat[:, 1], rois_flat[:, 2], rois_flat[:, 3])
+        
+        y1_norm = y1 / (fm_height - 1.0 + K.epsilon())
+        x1_norm = x1 / (fm_width - 1.0 + K.epsilon())
+        y2_norm = y2 / (fm_height - 1.0 + K.epsilon())
+        x2_norm = x2 / (fm_width - 1.0 + K.epsilon())
+        
+        normalized_boxes = K.stack([y1_norm, x1_norm, y2_norm, x2_norm], axis=1)
+        
+        feature_map_for_crop = feature_map
+        if self.data_format == "channels_first":
+            feature_map_for_crop = K.permute_dimensions(feature_map, (0, 2, 3, 1))
+            
         pooled_features = tf.image.crop_and_resize(
-            feature_map, normalized_boxes, box_indices, (self.pool_size, self.pool_size)
+            feature_map_for_crop, normalized_boxes, box_indices, (self.pool_size, self.pool_size), method="bilinear"
         )
-        final_output = K.reshape(pooled_features, (batch_size, num_rois_here, self.pool_size, self.pool_size, self.nb_channels))
-        return final_output
+        
+        if self.data_format == "channels_first":
+            pooled_features = K.permute_dimensions(pooled_features, (0, 3, 1, 2))
+            
+        reshape_dims = (
+            (batch_size, self.num_rois, self.nb_channels, self.pool_size, self.pool_size)
+            if self.data_format == "channels_first"
+            else (batch_size, self.num_rois, self.pool_size, self.pool_size, self.nb_channels)
+        )
+        
+        return K.reshape(pooled_features, reshape_dims)
+
+def nn_base_standard(input_tensor_param, trainable=False):
+    """VGG16 Backbone - SESUAI DENGAN KODE TRAINING."""
+    x = input_tensor_param
+    x = Conv2D(64, (3, 3), activation="relu", padding="same", name="block1_conv1", trainable=trainable)(x)
+    x = Conv2D(64, (3, 3), activation="relu", padding="same", name="block1_conv2", trainable=trainable)(x)
+    x = MaxPooling2D((2, 2), strides=(2, 2), name="block1_pool")(x)
+    
+    x = Conv2D(128, (3, 3), activation="relu", padding="same", name="block2_conv1", trainable=trainable)(x)
+    x = Conv2D(128, (3, 3), activation="relu", padding="same", name="block2_conv2", trainable=trainable)(x)
+    x = MaxPooling2D((2, 2), strides=(2, 2), name="block2_pool")(x)
+    C2 = x
+    
+    x = Conv2D(256, (3, 3), activation="relu", padding="same", name="block3_conv1", trainable=trainable)(x)
+    x = Conv2D(256, (3, 3), activation="relu", padding="same", name="block3_conv2", trainable=trainable)(x)
+    x = Conv2D(256, (3, 3), activation="relu", padding="same", name="block3_conv3", trainable=trainable)(x)
+    x = MaxPooling2D((2, 2), strides=(2, 2), name="block3_pool")(x)
+    C3 = x
+    
+    x = Conv2D(512, (3, 3), activation="relu", padding="same", name="block4_conv1", trainable=trainable)(x)
+    x = Conv2D(512, (3, 3), activation="relu", padding="same", name="block4_conv2", trainable=trainable)(x)
+    x = Conv2D(512, (3, 3), activation="relu", padding="same", name="block4_conv3", trainable=trainable)(x)
+    x = MaxPooling2D((2, 2), strides=(2, 2), name="block4_pool")(x)
+    C4 = x
+    
+    x = Conv2D(512, (3, 3), activation="relu", padding="same", name="block5_conv1", trainable=trainable)(x)
+    x = Conv2D(512, (3, 3), activation="relu", padding="same", name="block5_conv2", trainable=trainable)(x)
+    x = Conv2D(512, (3, 3), activation="relu", padding="same", name="block5_conv3", trainable=trainable)(x)
+    x = MaxPooling2D((2, 2), strides=(2, 2), name="block5_pool_for_c5")(x)
+    C5 = x
+    
+    return input_tensor_param, {"C2": C2, "C3": C3, "C4": C4, "C5": C5}
+
+
+def build_fpn_standard(backbone_feature_maps, fpn_channels=256):
+    """Membangun FPN dengan Lambda Layer - SESUAI DENGAN KODE TRAINING."""
+    C2, C3, C4, C5 = (backbone_feature_maps["C2"], backbone_feature_maps["C3"], backbone_feature_maps["C4"], backbone_feature_maps["C5"])
+    P5_in = Conv2D(fpn_channels, (1, 1), padding="same", name="fpn_c5p5")(C5)
+    P4_in = Conv2D(fpn_channels, (1, 1), padding="same", name="fpn_c4p4")(C4)
+    P3_in = Conv2D(fpn_channels, (1, 1), padding="same", name="fpn_c3p3")(C3)
+    P2_in = Conv2D(fpn_channels, (1, 1), padding="same", name="fpn_c2p2")(C2)
+
+    def resize_like(inputs, target_tensor):
+        target_shape = K.shape(target_tensor)
+        target_h, target_w = target_shape[1], target_shape[2]
+        return tf.image.resize(inputs, [target_h, target_w], method=tf.image.ResizeMethod.BILINEAR)
+
+    def get_output_shape_for_resize_like(input_shapes):
+        target_tensor_shape = input_shapes[1]
+        inputs_to_resize_shape = input_shapes[0]
+        return (inputs_to_resize_shape[0], target_tensor_shape[1], target_tensor_shape[2], inputs_to_resize_shape[3])
+
+    P5_up = Lambda(lambda x: resize_like(x[0], x[1]), output_shape=get_output_shape_for_resize_like, name="fpn_p5_up")([P5_in, P4_in])
+    P4_td = Add(name="fpn_p4add")([P5_up, P4_in])
+    P4_up = Lambda(lambda x: resize_like(x[0], x[1]), output_shape=get_output_shape_for_resize_like, name="fpn_p4_up")([P4_td, P3_in])
+    P3_td = Add(name="fpn_p3add")([P4_up, P3_in])
+    P3_up = Lambda(lambda x: resize_like(x[0], x[1]), output_shape=get_output_shape_for_resize_like, name="fpn_p3_up")([P3_td, P2_in])
+    P2_td = Add(name="fpn_p2add")([P3_up, P2_in])
+    
+    P5 = Conv2D(fpn_channels, (3, 3), padding="same", name="fpn_p5")(P5_in)
+    P4 = Conv2D(fpn_channels, (3, 3), padding="same", name="fpn_p4")(P4_td)
+    P3 = Conv2D(fpn_channels, (3, 3), padding="same", name="fpn_p3")(P3_td)
+    P2 = Conv2D(fpn_channels, (3, 3), padding="same", name="fpn_p2")(P2_td)
+    
+    return {"P2": P2, "P3": P3, "P4": P4, "P5": P5}
+
+
+def rpn_layer_standard(fpn_feat, num_anchors, level_name):
+    """RPN Head - SESUAI DENGAN KODE TRAINING."""
+    shared = Conv2D(512, (3, 3), padding='same', activation='relu', name=f'rpn_conv_shared_{level_name}')(fpn_feat)
+    x_class_logits = Conv2D(num_anchors, (1, 1), padding='same', activation=None, name=f'rpn_out_class_{level_name}_logits')(shared)
+    x_regr_params = Conv2D(num_anchors * 4, (1, 1), padding='same', activation='linear', name=f'rpn_out_regress_{level_name}_params')(shared)
+    return x_class_logits, x_regr_params
+
+def classifier_layer(pooled_rois, num_rois, nb_classes):
+    """Classifier Head - SESUAI DENGAN KODE TRAINING."""
+    out = TimeDistributed(Flatten(name="flatten_classifier"))(pooled_rois)
+    out = TimeDistributed(Dense(4096, activation="relu", kernel_initializer=initializers.RandomNormal(stddev=0.01), name="fc_classifier1"))(out)
+    out = TimeDistributed(Dropout(0.5))(out)
+    out = TimeDistributed(Dense(4096, activation="relu", kernel_initializer=initializers.RandomNormal(stddev=0.01), name="fc_classifier2"))(out)
+    out = TimeDistributed(Dropout(0.5))(out)
+    out_class = TimeDistributed(Dense(nb_classes, activation="softmax", kernel_initializer=initializers.RandomNormal(stddev=0.01)), name=f"dense_class_{nb_classes}")(out)
+    out_regr = TimeDistributed(Dense(4 * (nb_classes - 1), activation="linear", kernel_initializer=initializers.RandomNormal(stddev=0.01)), name=f"dense_regress_{nb_classes}")(out)
+    return [out_class, out_regr]
 
 def apply_regr(x, y, w, h, tx, ty, tw, th):
-    """Menerapkan regresi bounding box."""
     try:
         cx = x + w / 2.
         cy = y + h / 2.
@@ -122,17 +236,13 @@ def apply_regr(x, y, w, h, tx, ty, tw, th):
         return x, y, w, h
 
 def non_max_suppression_fast(boxes, probs, overlap_thresh=0.9, max_boxes=300):
-    """Non-Maximum Suppression."""
     if len(boxes) == 0:
         return [], []
-
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-
     if boxes.dtype.kind == "i": boxes = boxes.astype("float")
     pick = []
     area = (x2 - x1) * (y2 - y1)
     idxs = np.argsort(probs)
-
     while len(idxs) > 0:
         last = len(idxs) - 1
         i = idxs[last]
@@ -145,69 +255,53 @@ def non_max_suppression_fast(boxes, probs, overlap_thresh=0.9, max_boxes=300):
         h = np.maximum(0, yy2 - yy1)
         overlap = (w * h) / area[idxs[:last]]
         idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlap_thresh)[0])))
-
     if len(pick) > max_boxes: pick = pick[:max_boxes]
     return boxes[pick], probs[pick]
 
 def rpn_to_roi_fpn(rpn_cls_outputs, rpn_regr_outputs, C, img_shape):
-    """Mengkonversi output RPN dari semua level FPN menjadi RoI."""
     all_proposals = []
     all_probs = []
     for i, level_name in enumerate(C.fpn_pyramid_levels):
         P_cls_logits = rpn_cls_outputs[i][0]
-        P_cls = 1 / (1 + np.exp(-P_cls_logits)) # Terapkan sigmoid secara manual
+        P_cls = 1 / (1 + np.exp(-P_cls_logits))
         P_regr = rpn_regr_outputs[i][0]
         stride = C.fpn_strides[level_name]
         anchor_scales = C.anchor_box_scales[level_name]
         anchor_ratios = C.anchor_box_ratios
-
         (rows, cols) = P_cls.shape[:2]
-
         for anchor_ratio_idx, anchor_ratio in enumerate(anchor_ratios):
             for anchor_size_idx, anchor_size in enumerate(anchor_scales):
                 anchor_idx = anchor_ratio_idx + len(anchor_ratios) * anchor_size_idx
-
                 anchor_x, anchor_y = anchor_size * anchor_ratio[0], anchor_size * anchor_ratio[1]
-
                 regr = P_regr[:, :, anchor_idx*4:anchor_idx*4+4]
-
                 X_grid, Y_grid = np.meshgrid(np.arange(cols), np.arange(rows))
-
                 cx = X_grid * stride + stride / 2
                 cy = Y_grid * stride + stride / 2
-
                 cx = cx + regr[:, :, 0] * anchor_x
                 cy = cy + regr[:, :, 1] * anchor_y
                 w = np.exp(regr[:, :, 2]) * anchor_x
                 h = np.exp(regr[:, :, 3]) * anchor_y
-
                 x1 = cx - w / 2
                 y1 = cy - h / 2
                 x2 = x1 + w
                 y2 = y1 + h
-
                 proposals = np.stack([x1.flatten(), y1.flatten(), x2.flatten(), y2.flatten()], axis=1)
                 all_proposals.append(proposals)
                 all_probs.append(P_cls[:, :, anchor_idx].flatten())
-
     proposals = np.concatenate(all_proposals, axis=0)
     probs = np.concatenate(all_probs, axis=0)
-
     proposals[:, 0] = np.clip(proposals[:, 0], 0, img_shape[1] - 1)
     proposals[:, 1] = np.clip(proposals[:, 1], 0, img_shape[0] - 1)
     proposals[:, 2] = np.clip(proposals[:, 2], 0, img_shape[1] - 1)
     proposals[:, 3] = np.clip(proposals[:, 3], 0, img_shape[0] - 1)
-
     valid_indices = np.where(probs > 0.7)[0]
     proposals = proposals[valid_indices, :]
     probs = probs[valid_indices]
-    
     proposals, _ = non_max_suppression_fast(proposals, probs, overlap_thresh=0.7)
-
     return proposals
 
 # --------------------------------------------------------------------
-# BAGIAN 2: MEMUAT KONFIGURASI DAN MEMBANGUN MODEL (PENDEKATAN LOAD_MODEL)
+# BAGIAN 2: MEMUAT KONFIGURASI DAN MEMBANGUN MODEL
 # --------------------------------------------------------------------
 print("Memuat file konfigurasi...")
 try:
@@ -222,65 +316,72 @@ if CLASS_MAPPING is None:
 IDX_TO_CLASS = {v: k for k, v in CLASS_MAPPING.items()}
 print("Konfigurasi dimuat. Mapping kelas:", IDX_TO_CLASS)
 
-print(f"Memuat model lengkap dari '{MODEL_PATH}'...")
+print("Membangun arsitektur model lengkap yang identik dengan training...")
+
+# 1. Definisikan semua input yang diperlukan
+img_input = Input(shape=(None, None, 3), name="image_input_main")
+roi_input = Input(shape=(C.num_rois, 4), name="roi_input_model_all")
+
+# 2. Bangun backbone dan FPN sesuai skrip training
+_, backbone_maps = nn_base_standard(img_input, trainable=True)
+fpn_maps = build_fpn_standard(backbone_maps, fpn_channels=C.fpn_feature_channels)
+rpn_outputs = []
+for level in C.fpn_pyramid_levels:
+    rpn_outputs.extend(rpn_layer_standard(fpn_maps[level], C.num_anchors_per_location, level))
+
+# 3. Bangun bagian Classifier
+pooled_rois = RoiPoolingConv(C.pool_size, C.num_rois, name="roi_pooling_conv_main")([fpn_maps['P2'], roi_input])
+classifier_outputs = classifier_layer(pooled_rois, C.num_rois, len(CLASS_MAPPING))
+
+# 4. Buat model tunggal yang lengkap untuk memuat bobot
+model_for_loading = Model(inputs=[img_input, roi_input], outputs=rpn_outputs + classifier_outputs)
+
+# --- LANGKAH KUNCI: KOMPILASI MODEL UNTUK FINALISASI GRAFIK ---
+print("Melakukan kompilasi model untuk finalisasi...")
+# Optimizer dan loss tidak penting, ini hanya untuk memaksa model membangun dirinya sendiri
+model_for_loading.compile(optimizer='sgd', loss='mse')
+print("Model berhasil dikompilasi.")
+
+
+print(f"Memuat bobot dari '{MODEL_PATH}'...")
 try:
-    # Memuat model lengkap (arsitektur + bobot) dari file.
-    # 'custom_objects' diperlukan agar Keras mengenali lapisan kustom kita.
-    full_model = tf.keras.models.load_model(MODEL_PATH, custom_objects={'RoiPoolingConv': RoiPoolingConv})
-    print("Model lengkap berhasil dimuat.")
-    # full_model.summary() # Uncomment baris ini jika perlu debugging nama lapisan
+    # Memuat bobot berdasarkan nama lapisan yang sekarang sudah cocok
+    model_for_loading.load_weights(MODEL_PATH, by_name=True)
+    print("Bobot berhasil dimuat.")
 except Exception as e:
-    print(f"\nError saat memuat model dari file H5. Pastikan file tidak korup.")
-    raise Exception(f"Gagal memuat model dari '{MODEL_PATH}'. Error: {e}")
+    print("\nError saat memuat bobot. Ringkasan model untuk debugging:")
+    model_for_loading.summary(line_length=120)
+    raise Exception(f"Gagal memuat bobot dari '{MODEL_PATH}'. Error: {e}")
 
-# --- Rekonstruksi model-model untuk inferensi dari model yang sudah dimuat ---
-print("Mengekstrak dan membangun model RPN dan Classifier untuk inferensi...")
+# 5. Sekarang, definisikan model-model yang akan digunakan untuk prediksi.
+print("Membangun model RPN dan Classifier untuk inferensi...")
 
-try:
-    # --- Bangun model RPN ---
-    image_input = full_model.input[0] # Input gambar
-    
-    # Cari nama lapisan output RPN dan P2 feature map dari model yang dimuat
-    # Berdasarkan summary sebelumnya, P2 adalah input ke roi_pooling_conv
-    roi_pooling_input_layer = full_model.get_layer('roi_pooling_conv').input[0].name.split('/')[0]
-    p2_feature_map_output = full_model.get_layer(roi_pooling_input_layer).output
+model_rpn_fpn = Model(inputs=img_input, outputs=rpn_outputs + [fpn_maps['P2']])
 
-    # Output RPN adalah 8 lapisan terakhir sebelum 2 output classifier
-    rpn_outputs = full_model.outputs[:-2]
-    
-    model_rpn_fpn = Model(inputs=image_input, outputs=rpn_outputs + [p2_feature_map_output])
-    print("Model RPN berhasil dibangun.")
+feature_map_input = Input(shape=(None, None, C.fpn_feature_channels))
+roi_input_classifier = Input(shape=(C.num_rois, 4))
 
-    # --- Bangun model Classifier ---
-    # Kita perlu membuat ulang grafik classifier secara terpisah
-    feature_map_input = Input(shape=p2_feature_map_output.shape[1:])
-    roi_input_classifier = Input(shape=(C.num_rois, 4))
-    
-    # Gunakan kembali lapisan-lapisan dari model yang sudah dimuat
-    roi_pooling_layer = full_model.get_layer('roi_pooling_conv')
-    
-    # Cari model classifier yang nested
-    classifier_head_model = None
-    for layer in full_model.layers:
-        if layer.name.startswith('model'): # Biasanya bernama 'model', 'model_1', dst.
-            classifier_head_model = layer
-            break
-    if classifier_head_model is None:
-        raise ValueError("Tidak dapat menemukan model classifier head yang nested.")
+# Gunakan kembali lapisan yang sudah ada dan berisi bobot
+roi_pooling_layer = model_for_loading.get_layer("roi_pooling_conv_main")
+flatten_layer = model_for_loading.get_layer("flatten_classifier")
+fc1_layer = model_for_loading.get_layer("fc_classifier1")
+fc2_layer = model_for_loading.get_layer("fc_classifier2")
+cls_dense_layer = model_for_loading.get_layer(f"dense_class_{len(CLASS_MAPPING)}")
+regr_dense_layer = model_for_loading.get_layer(f"dense_regress_{len(CLASS_MAPPING)}")
 
-    pooled_rois = roi_pooling_layer([feature_map_input, roi_input_classifier])
-    classifier_outputs = classifier_head_model(pooled_rois)
+# Rangkai kembali classifier secara manual untuk model inferensi
+pooled_rois_for_pred = roi_pooling_layer([feature_map_input, roi_input_classifier])
+x = TimeDistributed(flatten_layer)(pooled_rois_for_pred)
+x = TimeDistributed(fc1_layer)(x)
+x = TimeDistributed(Dropout(0.5))(x)
+x = TimeDistributed(fc2_layer)(x)
+x = TimeDistributed(Dropout(0.5))(x)
+out_class_pred = TimeDistributed(cls_dense_layer)(x)
+out_regr_pred = TimeDistributed(regr_dense_layer)(x)
 
-    model_classifier_fpn = Model(inputs=[feature_map_input, roi_input_classifier], outputs=classifier_outputs)
-    print("Model Classifier berhasil dibangun.")
+model_classifier_fpn = Model(inputs=[feature_map_input, roi_input_classifier], outputs=[out_class_pred, out_regr_pred])
 
-except Exception as e:
-    print("\nError saat membangun model inferensi dari model yang dimuat.")
-    print("Cetak ringkasan model lengkap untuk debugging nama lapisan:")
-    full_model.summary(line_length=120)
-    raise e
-
-print("Semua model siap untuk prediksi.")
+print("Model siap untuk prediksi.")
 
 # --------------------------------------------------------------------
 # BAGIAN 3: FUNGSI PREPROCESSING DAN ROUTES FLASK
@@ -328,7 +429,6 @@ def detect():
     num_fpn_levels = len(C.fpn_pyramid_levels)
     num_rpn_outputs_per_level = 2
     
-    # Memisahkan output RPN dengan benar
     num_rpn_total_outputs = num_rpn_outputs_per_level * num_fpn_levels
     rpn_cls_outputs = [rpn_and_p2_outputs[i] for i in range(0, num_rpn_total_outputs, num_rpn_outputs_per_level)]
     rpn_regr_outputs = [rpn_and_p2_outputs[i] for i in range(1, num_rpn_total_outputs, num_rpn_outputs_per_level)]
@@ -404,4 +504,3 @@ if __name__ == '__main__':
     if not os.path.exists('static'):
         os.makedirs('static')
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
